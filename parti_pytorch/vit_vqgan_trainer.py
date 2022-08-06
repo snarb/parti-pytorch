@@ -9,13 +9,13 @@ import torch
 from torch import nn
 from torch.cuda.amp import autocast, GradScaler
 from torch.utils.data import Dataset, DataLoader, random_split
-
+#from apex.parallel import DistributedDataParallel as DDP
 import torchvision.transforms as T
 from torchvision.datasets import ImageFolder
 from torchvision.utils import make_grid, save_image
 
 from einops import rearrange
-
+from vx_config import *
 from parti_pytorch.vit_vqgan import VitVQGanVAE
 from parti_pytorch.optimizer import get_optimizer
 
@@ -60,24 +60,36 @@ class ImageDataset(Dataset):
         self.folder = folder
         self.image_size = image_size
         self.paths = [p for ext in exts for p in Path(f'{folder}').glob(f'**/*.{ext}')]
+        self.pathes_processed = 0
+        self.img = None
 
         print(f'{len(self.paths)} training samples found at {folder}')
-
         self.transform = T.Compose([
-            T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
-            T.Resize(image_size),
+            T.RandomCrop(CROP_SIZE),
             T.RandomHorizontalFlip(),
-            T.CenterCrop(image_size),
             T.ToTensor()
         ])
+        # self.transform = T.Compose([
+        #     T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+        #     T.Resize(image_size),
+        #     T.RandomHorizontalFlip(),
+        #     T.CenterCrop(image_size),
+        #     T.ToTensor()
+        # ])
 
     def __len__(self):
         return len(self.paths)
 
     def __getitem__(self, index):
         path = self.paths[index]
-        img = Image.open(path)
-        return self.transform(img)
+        if self.pathes_processed > CROPS_PER_IMG or self.img is None:
+            self.img = Image.open(path)
+            self.pathes_processed = 0
+        img = self.transform(self.img)
+        self.pathes_processed += 1
+        return img
+        #img = Image.open(path)
+        #return self.transform(img)
 
 # main trainer class
 
@@ -108,6 +120,9 @@ class VQGanVAETrainer(nn.Module):
         image_size = vae.image_size
 
         self.vae = vae
+        #
+        # self.vae = nn.parallel.DistributedDataParallel(self.vae,
+        #                                             device_ids=None)
         self.ema_vae = EMA(vae, update_after_step = ema_update_after_step, update_every = ema_update_every)
 
         self.register_buffer('steps', torch.Tensor([0]))
@@ -129,7 +144,7 @@ class VQGanVAETrainer(nn.Module):
 
         # create dataset
 
-        self.ds = ImageDataset(folder, image_size = image_size)
+        self.ds = ImageDataset(folder, image_size = image_size, exts = ['jpg', 'jpeg', 'png', 'JPG'])
 
         # split for validation
 
@@ -147,6 +162,7 @@ class VQGanVAETrainer(nn.Module):
         self.dl = cycle(DataLoader(
             self.ds,
             batch_size = batch_size,
+            num_workers = WORKERS_CNT,
             shuffle = True
         ))
 
